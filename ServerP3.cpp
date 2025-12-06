@@ -31,6 +31,7 @@ struct ClientInfo {
     int sock;
     std::string name;
     int id;
+    bool inMenu = true;
 };
 
 static std::vector<ClientInfo> clients;
@@ -45,10 +46,43 @@ void broadcastMessage(const std::string &msg, int exceptSock = -1) {
     }
 }
 
+// Trim helper: remove leading and trailing whitespace
+static std::string trim(const std::string &s) {
+    size_t start = 0;
+    while (start < s.size() && std::isspace((unsigned char)s[start])) start++;
+    size_t end = s.size();
+    while (end > start && std::isspace((unsigned char)s[end-1])) end--;
+    return s.substr(start, end - start);
+}
+
 std::string getClientNameById(int id) {
     std::lock_guard<std::mutex> lock(clients_mutex);
     for (auto &c : clients) if (c.id == id) return c.name;
     return std::string("Desconocido");
+}
+
+int getClientIdBySock(int sock) {
+    std::lock_guard<std::mutex> lock(clients_mutex);
+    for (auto &c : clients) if (c.sock == sock) return c.id;
+    return -1;
+}
+
+void setClientMenuState(int clientId, bool state) {
+    std::lock_guard<std::mutex> lock(clients_mutex);
+    for (auto &c : clients) if (c.id == clientId) { c.inMenu = state; break; }
+}
+
+void setAllClientsMenuState(bool state) {
+    std::lock_guard<std::mutex> lock(clients_mutex);
+    for (auto &c : clients) c.inMenu = state;
+}
+
+void sendMenuToClient(int sock) {
+    std::string menu = "Menu principal - comandos disponibles:\n";
+    menu += "/juego_trivia -> iniciar trivia (global)\n";
+    menu += "/piedra_papel_tijera -> jugar RPS (vs maquina o vs jugador)\n";
+    menu += "Para chatear aquí, debe haber exactamente 2 usuarios conectados; de lo contrario use un comando.\n";
+    send(sock, menu.c_str(), menu.size(), 0);
 }
 
 // Trivia game state
@@ -58,6 +92,7 @@ static std::string currentAnswer;
 static std::atomic<bool> answered(false);
 static std::mutex trivia_mutex;
 static std::map<int,int> triviaScores; // clientId -> score
+static int triviaLastResponder = -1;
 
 // Trivia: preguntas simples (pregunta, respuesta)
 static const std::vector<std::pair<std::string,std::string>> triviaQuestions = {
@@ -73,60 +108,120 @@ void triviaThread() {
         if (triviaActive.load()) return; // ya activo
         triviaActive = true;
         triviaScores.clear();
+        // marcar a todos los clientes como fuera del menu (en juego)
+        setAllClientsMenuState(false);
         // inicializar puntajes actuales
         std::lock_guard<std::mutex> lock2(clients_mutex);
         for (auto &c : clients) triviaScores[c.id] = 0;
     }
 
-    broadcastMessage("Inicia Trivia! Responde lo más rápido posible.\n");
+    // Enviar reglas básicas de la trivia
+    {
+        std::ostringstream rules;
+        rules << "Inicia Trivia! Responde lo más rápido posible.\n";
+        rules << "Reglas: " << triviaQuestions.size() << " preguntas. El primer jugador en enviar la respuesta correcta obtiene 1 punto por pregunta.\n";
+        rules << "Tiempo por pregunta: 10 segundos.\n";
+        broadcastMessage(rules.str());
+    }
 
     for (auto &q : triviaQuestions) {
+        std::string originalAnswer = q.second;
+        // normalize answer to lower-case trimmed for comparison
+        std::string norm = q.second;
+        while (!norm.empty() && (norm.back() == '\n' || norm.back() == '\r' || norm.back()==' ')) norm.pop_back();
+        while (!norm.empty() && (norm.front()==' ')) norm.erase(norm.begin());
+        std::transform(norm.begin(), norm.end(), norm.begin(), ::tolower);
+
         {
             std::lock_guard<std::mutex> lock(trivia_mutex);
-            currentAnswer = q.second;
+            currentAnswer = norm;
             answered = false;
+            triviaLastResponder = -1;
             questionActive = true;
         }
+
         std::string pregunta = std::string("Pregunta: ") + q.first + "\n";
         broadcastMessage(pregunta);
 
-        // esperar un tiempo para respuestas (8 segundos)
-        std::this_thread::sleep_for(std::chrono::seconds(8));
+        // Habilitar la escritura para respuestas y esperar hasta 10 segundos o hasta que alguien responda
+        {
+            std::lock_guard<std::mutex> lock(trivia_mutex);
+            questionActive = true;
+            answered = false;
+            triviaLastResponder = -1;
+        }
+
+        // Informar a los clientes que tienen 10 segundos para responder
+        broadcastMessage("Escribe tu respuesta ahora (10s)\n");
+
+        const int timeoutMs = 10000;
+        const int stepMs = 100;
+        int waited = 0;
+        while (waited < timeoutMs) {
+            if (answered.load()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(stepMs));
+            waited += stepMs;
+        }
 
         {
             std::lock_guard<std::mutex> lock(trivia_mutex);
             questionActive = false;
         }
 
-        // anunciar respuesta correcta
-        std::string correcta = std::string("Respuesta correcta: ") + q.second + "\n";
-        broadcastMessage(correcta);
+        // anunciar resultado (si alguien respondió, lo hizo antes y triviaLastResponder está seteado)
+        if (answered.load() && triviaLastResponder != -1) {
+            std::string quien = getClientNameById(triviaLastResponder);
+            std::string msg = "Respuesta correcta de: " + quien + " (" + originalAnswer + ")\n";
+            broadcastMessage(msg);
+        } else {
+            std::string correcta = std::string("Respuesta correcta: ") + originalAnswer + "\n";
+            broadcastMessage(correcta);
+            broadcastMessage("Nadie respondió correctamente en tiempo.\n");
+        }
         // breve pausa antes de la siguiente pregunta
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
     // Resultado final
+    std::string resultsStr;
     {
         std::ostringstream oss;
         oss << "Resultados de la Trivia:\n";
-        std::lock_guard<std::mutex> lock(clients_mutex);
+        // Lock trivia mutex first then clients to avoid deadlocks (consistent order)
+        std::lock_guard<std::mutex> lockt(trivia_mutex);
+        std::lock_guard<std::mutex> lockc(clients_mutex);
         for (auto &c : clients) {
             int s = 0;
-            {
-                std::lock_guard<std::mutex> lock2(trivia_mutex);
-                if (triviaScores.count(c.id)) s = triviaScores[c.id];
-            }
+            if (triviaScores.count(c.id)) s = triviaScores[c.id];
             oss << c.name << ": " << s << "\n";
         }
-        broadcastMessage(oss.str());
+        resultsStr = oss.str();
+    }
+    // Broadcast fuera de locks
+    broadcastMessage(resultsStr);
+
+    // Avisar que la partida terminó y devolver al menu principal
+    broadcastMessage("partida terminada, volviendo al menu principal\n");
+
+    // Preparar lista de sockets y luego enviar menús fuera del lock
+    std::vector<int> clientSocks;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        for (auto &c : clients) clientSocks.push_back(c.sock);
     }
 
+    // Marcar trivia como inactiva antes de enviar menús
     triviaActive = false;
+    setAllClientsMenuState(true);
+
+    for (int s : clientSocks) sendMenuToClient(s);
 }
 
 // Forward declarations for functions used before their definitions
 void piedrapapeltijeras(int sockCliente);
 void tivia(int sockCliente);
+void playRPSvsMachine(int sockCliente, const std::string &nombre);
+void playRPSvsPlayer(int sockCliente, const std::string &nombre, int clientId);
 void manejarCliente(int sockCliente, int clientId);
 
 void crearSocket(int &sock) {
@@ -270,10 +365,7 @@ static std::mutex waiting_mutex;
 
 // Normaliza el movimiento (minúsculas) y acepta varias formas
 std::string normalizeMove(const std::string &m) {
-    std::string s = m;
-    // trim
-    while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back()==' ')) s.pop_back();
-    while (!s.empty() && (s.front()==' ')) s.erase(s.begin());
+    std::string s = trim(m);
     std::transform(s.begin(), s.end(), s.begin(), ::tolower);
     if (s == "piedra" || s == "p") return "piedra";
     if (s == "papel" || s == "pa") return "papel";
@@ -292,52 +384,262 @@ int decideRPS(const std::string &a, const std::string &b) {
 
 // Juego vs máquina
 void playRPSvsMachine(int sockCliente, const std::string &nombre) {
-    std::string prompt = "Elegiste jugar contra la máquina. Envía 'piedra', 'papel' o 'tijera' (o escribe CANCEL para salir)\n";
+    // marcar cliente como en juego (fuera del menu)
+    int cid = getClientIdBySock(sockCliente);
+    if (cid != -1) setClientMenuState(cid, false);
     const int maxAttempts = 5;
-    int attempts = 0;
     std::string move;
-    while (attempts < maxAttempts) {
-        send(sockCliente, prompt.c_str(), prompt.size(), 0);
-        char buf[BUFFERSIZE] = {0};
-        int n = read(sockCliente, buf, BUFFERSIZE - 1);
-        if (n <= 0) return; // cliente desconectó
-        buf[n] = '\0';
-        std::string raw(buf);
-        // Trim
-        while (!raw.empty() && (raw.back() == '\n' || raw.back() == '\r')) raw.pop_back();
-        if (raw == "CANCEL" || raw == "cancel" || raw == "Cancel") {
-            send(sockCliente, "Partida cancelada por el usuario.\n", 33, 0);
-            return;
-        }
-        move = normalizeMove(raw);
-        if (move == "piedra" || move == "papel" || move == "tijera") break;
-        std::string inval = "Movimiento inválido. Intenta de nuevo o escribe CANCEL para salir.\n";
-        send(sockCliente, inval.c_str(), inval.size(), 0);
-        attempts++;
-    }
-
-    if (!(move == "piedra" || move == "papel" || move == "tijera")) {
-        send(sockCliente, "No se recibió un movimiento válido. Se cancela la partida.\n", 50, 0);
-        return;
-    }
-
-    // Generar movimiento de la máquina
     static std::random_device rd;
     static std::mt19937 gen(rd());
     static std::uniform_int_distribution<int> dist(0,2);
-    int r = dist(gen);
-    std::string machine = (r==0?"piedra":(r==1?"papel":"tijera"));
 
-    int res = decideRPS(move, machine);
-    std::string resultado;
-    if (res == 0) resultado = "Empate! Ambos eligieron " + move + "\n";
-    else if (res == 1) resultado = "Ganaste! Tu " + move + " vence a " + machine + "\n";
-    else resultado = "Perdiste. Tu " + move + " pierde contra " + machine + "\n";
+    while (true) {
+        std::string prompt = "Elegiste jugar contra la máquina. Envía 'piedra', 'papel' o 'tijera' (o escribe CANCEL para salir)\n";
+        int attempts = 0;
+        move.clear();
 
-    send(sockCliente, resultado.c_str(), resultado.size(), 0);
-    // Mensaje de cierre de partida para volver al flujo de chat
-    std::string endmsg = "Fin de la partida. Escribe /piedra_papel_tijera para volver a jugar o cualquier mensaje para el chat.\n";
-    send(sockCliente, endmsg.c_str(), endmsg.size(), 0);
+        while (attempts < maxAttempts) {
+            send(sockCliente, prompt.c_str(), prompt.size(), 0);
+            char buf[BUFFERSIZE] = {0};
+            int n = read(sockCliente, buf, BUFFERSIZE - 1);
+            if (n <= 0) {
+                // cliente desconectó
+                if (cid != -1) setClientMenuState(cid, true);
+                return;
+            }
+            buf[n] = '\0';
+            std::string raw(buf);
+            raw = trim(raw);
+            std::string rawLower = raw;
+            std::transform(rawLower.begin(), rawLower.end(), rawLower.begin(), ::tolower);
+            if (rawLower == "cancel") {
+                send(sockCliente, "Partida cancelada por el usuario.\n", 33, 0);
+                if (cid != -1) {
+                    setClientMenuState(cid, true);
+                    sendMenuToClient(sockCliente);
+                }
+                return;
+            }
+            move = normalizeMove(raw);
+            if (move == "piedra" || move == "papel" || move == "tijera") break;
+            std::string inval = "Movimiento inválido. Intenta de nuevo o escribe CANCEL para salir.\n";
+            send(sockCliente, inval.c_str(), inval.size(), 0);
+            attempts++;
+        }
+
+        if (!(move == "piedra" || move == "papel" || move == "tijera")) {
+            send(sockCliente, "No se recibió un movimiento válido. Se cancela la partida.\n", 50, 0);
+            if (cid != -1) {
+                setClientMenuState(cid, true);
+                sendMenuToClient(sockCliente);
+            }
+            return;
+        }
+
+        // Generar movimiento de la máquina
+        int r = dist(gen);
+        std::string machine = (r==0?"piedra":(r==1?"papel":"tijera"));
+
+        int res = decideRPS(move, machine);
+        std::string resultado;
+        if (res == 0) resultado = "Empate! Ambos eligieron " + move + "\n";
+        else if (res == 1) resultado = "Ganaste! Tu " + move + " vence a " + machine + "\n";
+        else resultado = "Perdiste. Tu " + move + " pierde contra " + machine + "\n";
+
+        send(sockCliente, resultado.c_str(), resultado.size(), 0);
+        // Anunciar resultado a la sala (RPS vs máquina)
+        {
+            std::string summary = "RPS - ";
+            summary += nombre + " (" + move + ") vs Máquina (" + machine + "): ";
+            if (res == 0) summary += "Empate\n";
+            else if (res == 1) summary += nombre + " gana\n";
+            else summary += "Máquina gana\n";
+            broadcastMessage(summary);
+        }
+
+        if (res == 0) {
+            // Empate: ofrecer volver a jugar
+            std::string ask = "Empate! ¿Jugar otra ronda? (si/no)\n";
+            send(sockCliente, ask.c_str(), ask.size(), 0);
+            char rb[BUFFERSIZE] = {0};
+            int rn = read(sockCliente, rb, BUFFERSIZE - 1);
+            if (rn <= 0) {
+                if (cid != -1) setClientMenuState(cid, true);
+                return;
+            }
+            rb[rn] = '\0';
+            std::string ans(rb);
+            while (!ans.empty() && (ans.back()=='\n' || ans.back()=='\r')) ans.pop_back();
+            std::transform(ans.begin(), ans.end(), ans.begin(), ::tolower);
+            if (ans == "si" || ans == "s" || ans == "yes" || ans == "y") {
+                // continuar lazo y jugar otra ronda
+                continue;
+            } else {
+                std::string endmsg = "partida terminada, volviendo al menu principal\n";
+                send(sockCliente, endmsg.c_str(), endmsg.size(), 0);
+                if (cid != -1) {
+                    setClientMenuState(cid, true);
+                    sendMenuToClient(sockCliente);
+                }
+                return;
+            }
+        } else {
+            // Win or lose: finalizar y volver al menu
+            std::string endmsg = "partida terminada, volviendo al menu principal\n";
+            send(sockCliente, endmsg.c_str(), endmsg.size(), 0);
+            if (cid != -1) {
+                setClientMenuState(cid, true);
+                sendMenuToClient(sockCliente);
+            }
+            return;
+        }
+    }
+}
+
+void playRPSvsPlayer(int sockCliente, const std::string &nombre, int clientId) {
+    std::shared_ptr<PvPGame> mygame;
+    {
+        std::lock_guard<std::mutex> lock(waiting_mutex);
+        if (!waitingGame) {
+            // No one is waiting, create a new game
+            waitingGame = std::make_shared<PvPGame>();
+            waitingGame->player1Id = clientId;
+            waitingGame->player1Sock = sockCliente;
+            waitingGame->player1Name = nombre;
+            mygame = waitingGame;
+        } else {
+            // Someone is waiting, join their game
+            mygame = waitingGame;
+            waitingGame = nullptr; // Clear the waiting game
+            mygame->player2Id = clientId;
+            mygame->player2Sock = sockCliente;
+            mygame->player2Name = nombre;
+        }
+    }
+
+    if (mygame->player2Id == -1) {
+        // I am the first player, wait for the second
+        send(sockCliente, "Esperando rival...\n", 20, 0);
+        std::unique_lock<std::mutex> lk(mygame->mtx);
+        if (!mygame->cv.wait_for(lk, std::chrono::seconds(30), [&]{ return mygame->player2Id != -1; })) {
+            // Timeout
+            send(sockCliente, "Nadie se unió. Volviendo al menú.\n", 35, 0);
+            setClientMenuState(clientId, true);
+            sendMenuToClient(sockCliente);
+            waitingGame = nullptr; // Clear the waiting game
+            return;
+        }
+    } else {
+        // I am the second player, notify the first
+        mygame->cv.notify_all();
+    }
+
+    // Both players are matched
+    setClientMenuState(mygame->player1Id, false);
+    setClientMenuState(mygame->player2Id, false);
+
+    // Game logic here
+    // Each player sends their move, we determine the winner, etc.
+    // For now, let's just simulate one round:
+
+    while (true) {
+        std::string prompt1 = "Jugador 1 (" + mygame->player1Name + "), elige: piedra, papel o tijera (o escribe CANCEL para salir)\n";
+        send(mygame->player1Sock, prompt1.c_str(), prompt1.size(), 0);
+
+        std::string prompt2 = "Jugador 2 (" + mygame->player2Name + "), elige: piedra, papel o tijera (o escribe CANCEL para salir)\n";
+        send(mygame->player2Sock, prompt2.c_str(), prompt2.size(), 0);
+
+        // Leer movimientos de ambos jugadores
+        for (int i = 0; i < 2; ++i) {
+            char buf[BUFFERSIZE] = {0};
+            int n = read((i == 0 ? mygame->player1Sock : mygame->player2Sock), buf, BUFFERSIZE - 1);
+            if (n <= 0) {
+                // cliente desconectó
+                if (i == 0) {
+                    // Player 1 disconnected
+                    send(mygame->player2Sock, "El jugador 1 se ha desconectado. Fin del juego.\n", 45, 0);
+                } else {
+                    // Player 2 disconnected
+                    send(mygame->player1Sock, "El jugador 2 se ha desconectado. Fin del juego.\n", 45, 0);
+                }
+                // Cleanup and exit
+                setClientMenuState(mygame->player1Id, true);
+                setClientMenuState(mygame->player2Id, true);
+                sendMenuToClient(mygame->player1Sock);
+                sendMenuToClient(mygame->player2Sock);
+                return;
+            }
+            buf[n] = '\0';
+            std::string raw(buf);
+            raw = trim(raw);
+            std::string rawLower = raw;
+            std::transform(rawLower.begin(), rawLower.end(), rawLower.begin(), ::tolower);
+            if (rawLower == "cancel") {
+                send(mygame->player1Sock, "Partida cancelada por el usuario.\n", 33, 0);
+                send(mygame->player2Sock, "El otro jugador canceló la partida.\n", 36, 0);
+                // Cleanup and exit
+                setClientMenuState(mygame->player1Id, true);
+                setClientMenuState(mygame->player2Id, true);
+                sendMenuToClient(mygame->player1Sock);
+                sendMenuToClient(mygame->player2Sock);
+                return;
+            }
+            if (i == 0) {
+                mygame->move1 = normalizeMove(raw);
+            } else {
+                mygame->move2 = normalizeMove(raw);
+            }
+        }
+
+        // Ambos jugadores han hecho su movimiento, determinar ganador
+        int res = decideRPS(mygame->move1, mygame->move2);
+        std::string resultado;
+        if (res == 0) resultado = "Empate! Ambos eligieron " + mygame->move1 + "\n";
+        else if (res == 1) resultado = "Jugador 1 gana! " + mygame->move1 + " vence a " + mygame->move2 + "\n";
+        else resultado = "Jugador 2 gana! " + mygame->move2 + " vence a " + mygame->move1 + "\n";
+
+        send(mygame->player1Sock, resultado.c_str(), resultado.size(), 0);
+        send(mygame->player2Sock, resultado.c_str(), resultado.size(), 0);
+
+        // Preguntar si quieren volver a jugar
+        for (int i = 0; i < 2; ++i) {
+            std::string ask = "¿Jugar otra ronda, " + (i == 0 ? mygame->player1Name : mygame->player2Name) + "? (si/no)\n";
+            send((i == 0 ? mygame->player1Sock : mygame->player2Sock), ask.c_str(), ask.size(), 0);
+            char rb[BUFFERSIZE] = {0};
+            int rn = read((i == 0 ? mygame->player1Sock : mygame->player2Sock), rb, BUFFERSIZE - 1);
+            if (rn <= 0) {
+                // cliente desconectó
+                if (i == 0) {
+                    // Player 1 disconnected
+                    send(mygame->player2Sock, "El jugador 1 se ha desconectado. Fin del juego.\n", 45, 0);
+                } else {
+                    // Player 2 disconnected
+                    send(mygame->player1Sock, "El jugador 2 se ha desconectado. Fin del juego.\n", 45, 0);
+                }
+                // Cleanup and exit
+                setClientMenuState(mygame->player1Id, true);
+                setClientMenuState(mygame->player2Id, true);
+                sendMenuToClient(mygame->player1Sock);
+                sendMenuToClient(mygame->player2Sock);
+                return;
+            }
+            rb[rn] = '\0';
+            std::string ans(rb);
+            while (!ans.empty() && (ans.back()=='\n' || ans.back()=='\r')) ans.pop_back();
+            std::transform(ans.begin(), ans.end(), ans.begin(), ::tolower);
+            if (ans != "si" && ans != "s" && ans != "yes" && ans != "y") {
+                std::string endmsg = "partida terminada, volviendo al menu principal\n";
+                send(mygame->player1Sock, endmsg.c_str(), endmsg.size(), 0);
+                send(mygame->player2Sock, endmsg.c_str(), endmsg.size(), 0);
+                setClientMenuState(mygame->player1Id, true);
+                setClientMenuState(mygame->player2Id, true);
+                sendMenuToClient(mygame->player1Sock);
+                sendMenuToClient(mygame->player2Sock);
+                return;
+            }
+        }
+        // Si ambos quieren seguir, continuar el bucle y jugar otra ronda
+    }
 }
 
 void manejarCliente(int sockCliente, int clientId) {
@@ -355,16 +657,23 @@ void manejarCliente(int sockCliente, int clientId) {
     std::string nombre(buffer);
     while (!nombre.empty() && (nombre.back() == '\n' || nombre.back() == '\r')) nombre.pop_back();
 
-    // Registrar cliente
+    // Registrar cliente (en menu por defecto)
     {
         std::lock_guard<std::mutex> lock(clients_mutex);
-        clients.push_back({sockCliente, nombre, clientId});
+        ClientInfo ci;
+        ci.sock = sockCliente;
+        ci.name = nombre;
+        ci.id = clientId;
+        ci.inMenu = true;
+        clients.push_back(ci);
     }
 
     // Enviar bienvenida local y notificar a la sala
     std::string bienvenida = "Bienvenido " + nombre + "\n";
     send(sockCliente, bienvenida.c_str(), bienvenida.size(), 0);
     broadcastMessage("Usuario " + nombre + " se ha conectado\n", sockCliente);
+    // Enviar menú inicial al cliente
+    sendMenuToClient(sockCliente);
 
     // Bucle principal: recibir mensajes del cliente
     while (true) {
@@ -373,14 +682,16 @@ void manejarCliente(int sockCliente, int clientId) {
         if (n <= 0) break;
         buf[n] = '\0';
         std::string msg(buf);
-        // Trim newline(s)
-        while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) msg.pop_back();
+        // Trim leading/trailing whitespace
+        msg = trim(msg);
 
         if (msg.empty()) continue;
 
         // Comandos que inician juegos
         if (msg == "/juego_trivia") {
             if (!triviaActive.load()) {
+                // marcar a todos como en juego y lanzar trivia
+                setAllClientsMenuState(false);
                 std::thread t(triviaThread);
                 t.detach();
             } else {
@@ -390,296 +701,45 @@ void manejarCliente(int sockCliente, int clientId) {
         }
 
         if (msg == "/piedra_papel_tijera") {
-            // Iniciar flujo de Piedra-Papel-Tijera
+            setClientMenuState(clientId, false); // Mark as out of menu to process game input
+            
             std::string prompt = "Elige modo: 1) vs Maquina 2) vs Jugador\n";
             send(sockCliente, prompt.c_str(), prompt.size(), 0);
 
-            // Leer la elección del cliente
             char choiceBuf[BUFFERSIZE] = {0};
             int cn = read(sockCliente, choiceBuf, BUFFERSIZE - 1);
-            if (cn <= 0) break;
-            choiceBuf[cn] = '\0';
-            std::string choice(choiceBuf);
-            while (!choice.empty() && (choice.back() == '\n' || choice.back() == '\r')) choice.pop_back();
 
-            if (choice == "1") {
-                // vs máquina
-                playRPSvsMachine(sockCliente, nombre);
-                continue;
-            } else if (choice == "2") {
-                // vs jugador: emparejar
-                std::shared_ptr<PvPGame> mygame;
-                {
-                    std::lock_guard<std::mutex> lock(waiting_mutex);
-                    if (!waitingGame) {
-                        // No hay nadie esperando: ser el primero
-                        waitingGame = std::make_shared<PvPGame>();
-                        waitingGame->player1Id = clientId;
-                        waitingGame->player1Sock = sockCliente;
-                        waitingGame->player1Name = nombre;
-                        mygame = waitingGame;
-                    } else {
-                        // Hay alguien esperando: emparejar
-                        mygame = waitingGame;
-                        waitingGame = nullptr; // consumir la espera
-                        mygame->player2Id = clientId;
-                        mygame->player2Sock = sockCliente;
-                        mygame->player2Name = nombre;
-                    }
-                }
+            if (cn > 0) {
+                choiceBuf[cn] = '\0';
+                std::string choice = trim(std::string(choiceBuf));
 
-                if (mygame->player2Id == -1) {
-                    // Soy el primero: esperar a que llegue otro
-                    send(sockCliente, "Esperando rival...\n", 20, 0);
-                    std::unique_lock<std::mutex> lk(mygame->mtx);
-                    mygame->cv.wait(lk, [&]{ return mygame->player2Id != -1; });
+                if (choice == "1") {
+                    playRPSvsMachine(sockCliente, nombre);
+                } else if (choice == "2") {
+                    playRPSvsPlayer(sockCliente, nombre, clientId);
                 } else {
-                    // Soy el segundo: notificar al primero
-                    {
-                        std::lock_guard<std::mutex> lk(mygame->mtx);
-                        mygame->cv.notify_all();
-                    }
+                    send(sockCliente, "Opción inválida. Volviendo al menú.\n", 38, 0);
+                    setClientMenuState(clientId, true); // Restore menu state
+                    sendMenuToClient(sockCliente);
                 }
-
-                // En este punto ambos players deben estar en mygame
-                // Ejecutar rondas hasta que uno no quiera seguir o haya desconexión
-                bool gameOver = false;
-                while (!gameOver) {
-                    // Pida movimiento al correspondiente jugador
-                    if (clientId == mygame->player1Id) {
-                        std::string info = "Emparejado con " + mygame->player2Name + ". Envía 'piedra','papel' o 'tijera'\n";
-                        send(sockCliente, info.c_str(), info.size(), 0);
-                        // leer movimiento con hasta 3 intentos
-                        const int maxMoveAttempts = 3;
-                        int moveAttempts = 0;
-                        std::string mv;
-                        while (moveAttempts < maxMoveAttempts) {
-                            char mb[BUFFERSIZE] = {0};
-                            int rn = read(sockCliente, mb, BUFFERSIZE - 1);
-                            if (rn <= 0) {
-                                // desconexión: notificar adversario y terminar
-                                send(mygame->player2Sock, "Rival desconectó. Partida cancelada\n", 34, 0);
-                                gameOver = true;
-                                break;
-                            }
-                            mb[rn] = '\0';
-                            mv = normalizeMove(std::string(mb));
-                            if (mv == "piedra" || mv == "papel" || mv == "tijera") break;
-                            send(sockCliente, "Movimiento inválido. Intenta de nuevo.\n", 34, 0);
-                            moveAttempts++;
-                        }
-                        if (gameOver) break;
-                        if (!(mv == "piedra" || mv == "papel" || mv == "tijera")) {
-                            send(sockCliente, "No se recibió un movimiento válido. Partida cancelada\n", 48, 0);
-                            send(mygame->player2Sock, "Rival no envió movimiento válido. Partida cancelada\n", 48, 0);
-                            break;
-                        }
-                        {
-                            std::lock_guard<std::mutex> lk(mygame->mtx);
-                            mygame->move1 = mv;
-                            mygame->ready1 = true;
-                        }
-                        mygame->cv.notify_all();
-
-                        // Esperar a que el otro envie su movimiento
-                        std::unique_lock<std::mutex> lk2(mygame->mtx);
-                        mygame->cv.wait(lk2, [&]{ return mygame->ready2 || gameOver; });
-                        if (gameOver) break;
-
-                        // Calcular resultado (jugador1 hace el cálculo)
-                        if (!mygame->resultSent) {
-                            int res = decideRPS(mygame->move1, mygame->move2);
-                            std::string r1, r2;
-                            if (res == 0) {
-                                r1 = r2 = "Empate! Ambos eligieron " + mygame->move1 + "\n";
-                            } else if (res == 1) {
-                                r1 = "Ganaste! Tu " + mygame->move1 + " vence a " + mygame->move2 + "\n";
-                                r2 = "Perdiste. Tu " + mygame->move2 + " pierde contra " + mygame->move1 + "\n";
-                            } else {
-                                r2 = "Ganaste! Tu " + mygame->move2 + " vence a " + mygame->move1 + "\n";
-                                r1 = "Perdiste. Tu " + mygame->move1 + " pierde contra " + mygame->move2 + "\n";
-                            }
-                            send(mygame->player1Sock, r1.c_str(), r1.size(), 0);
-                            send(mygame->player2Sock, r2.c_str(), r2.size(), 0);
-                            mygame->resultSent = true;
-                        }
-
-                        // Preguntar a ambos si desean jugar otra ronda
-                        send(mygame->player1Sock, "¿Jugar otra ronda? (si/no)\n", 27, 0);
-                        send(mygame->player2Sock, "¿Jugar otra ronda? (si/no)\n", 27, 0);
-
-                        // leer respuesta del jugador1
-                        char rb1[BUFFERSIZE] = {0};
-                        int r1n = read(mygame->player1Sock, rb1, BUFFERSIZE - 1);
-                        if (r1n <= 0) {
-                            send(mygame->player2Sock, "Rival desconectó. Partida finalizada\n", 34, 0);
-                            gameOver = true;
-                        } else {
-                            rb1[r1n] = '\0';
-                            std::string ans1(rb1);
-                            while (!ans1.empty() && (ans1.back()=='\n'||ans1.back()=='\r')) ans1.pop_back();
-                            std::transform(ans1.begin(), ans1.end(), ans1.begin(), ::tolower);
-                            mygame->replay1 = (ans1 == "si" || ans1 == "s" || ans1 == "yes" || ans1 == "y");
-                            mygame->hasReplay1 = true;
-                        }
-
-                        // esperar respuesta del jugador2 (su hilo hará la lectura, pero si jugador2 ya leyó, check)
-                        std::unique_lock<std::mutex> lk3(mygame->mtx);
-                        mygame->cv.notify_all();
-                        // esperar hasta que both have hasReplay or gameOver
-                        mygame->cv.wait_for(lk3, std::chrono::seconds(15), [&]{ return mygame->hasReplay2 || gameOver; });
-
-                        if (gameOver) break;
-
-                        // Si jugador2 no respondió a tiempo, considerar no
-                        if (!mygame->hasReplay2) mygame->replay2 = false;
-
-                        if (mygame->replay1 && mygame->replay2) {
-                            // reiniciar flags para nueva ronda
-                            mygame->move1.clear(); mygame->move2.clear();
-                            mygame->ready1 = mygame->ready2 = false;
-                            mygame->resultSent = false;
-                            mygame->hasReplay1 = mygame->hasReplay2 = false;
-                            mygame->replay1 = mygame->replay2 = false;
-                            // continuar a siguiente ronda
-                            continue;
-                        } else {
-                            // notificar fin de la partida
-                            send(mygame->player1Sock, "Partida finalizada. Volviendo al chat.\n", 37, 0);
-                            send(mygame->player2Sock, "Partida finalizada. Volviendo al chat.\n", 37, 0);
-                            gameOver = true;
-                            break;
-                        }
-                    } else if (clientId == mygame->player2Id) {
-                        // jugador 2 (similar flujo)
-                        std::string info = "Emparejado con " + mygame->player1Name + ". Envía 'piedra','papel' o 'tijera'\n";
-                        send(sockCliente, info.c_str(), info.size(), 0);
-                        // notificar posible waiter
-                        {
-                            std::lock_guard<std::mutex> lk(mygame->mtx);
-                            mygame->cv.notify_all();
-                        }
-                        const int maxMoveAttempts = 3;
-                        int moveAttempts = 0;
-                        std::string mv;
-                        while (moveAttempts < maxMoveAttempts) {
-                            char mb[BUFFERSIZE] = {0};
-                            int rn = read(sockCliente, mb, BUFFERSIZE - 1);
-                            if (rn <= 0) {
-                                send(mygame->player1Sock, "Rival desconectó. Partida cancelada\n", 34, 0);
-                                gameOver = true;
-                                break;
-                            }
-                            mb[rn] = '\0';
-                            mv = normalizeMove(std::string(mb));
-                            if (mv == "piedra" || mv == "papel" || mv == "tijera") break;
-                            send(sockCliente, "Movimiento inválido. Intenta de nuevo.\n", 34, 0);
-                            moveAttempts++;
-                        }
-                        if (gameOver) break;
-                        if (!(mv == "piedra" || mv == "papel" || mv == "tijera")) {
-                            send(sockCliente, "No se recibió un movimiento válido. Partida cancelada\n", 48, 0);
-                            send(mygame->player1Sock, "Rival no envió movimiento válido. Partida cancelada\n", 48, 0);
-                            break;
-                        }
-                        {
-                            std::lock_guard<std::mutex> lk(mygame->mtx);
-                            mygame->move2 = mv;
-                            mygame->ready2 = true;
-                        }
-                        mygame->cv.notify_all();
-
-                        // Esperar a que el otro envie su movimiento
-                        std::unique_lock<std::mutex> lk2(mygame->mtx);
-                        mygame->cv.wait(lk2, [&]{ return mygame->ready1 || gameOver; });
-                        if (gameOver) break;
-
-                        // Si jugador2 no fue quien calculó resultado, puede observar y luego responder
-                        if (!mygame->resultSent) {
-                            int res = decideRPS(mygame->move1, mygame->move2);
-                            std::string r1, r2;
-                            if (res == 0) {
-                                r1 = r2 = "Empate! Ambos eligieron " + mygame->move1 + "\n";
-                            } else if (res == 1) {
-                                r1 = "Ganaste! Tu " + mygame->move1 + " vence a " + mygame->move2 + "\n";
-                                r2 = "Perdiste. Tu " + mygame->move2 + " pierde contra " + mygame->move1 + "\n";
-                            } else {
-                                r2 = "Ganaste! Tu " + mygame->move2 + " vence a " + mygame->move1 + "\n";
-                                r1 = "Perdiste. Tu " + mygame->move1 + " pierde contra " + mygame->move2 + "\n";
-                            }
-                            send(mygame->player1Sock, r1.c_str(), r1.size(), 0);
-                            send(mygame->player2Sock, r2.c_str(), r2.size(), 0);
-                            mygame->resultSent = true;
-                        }
-
-                        // Preguntar a ambos si desean jugar otra ronda (cada hilo lee su propia respuesta)
-                        // leer propia respuesta
-                        send(mygame->player1Sock, "¿Jugar otra ronda? (si/no)\n", 27, 0);
-                        send(mygame->player2Sock, "¿Jugar otra ronda? (si/no)\n", 27, 0);
-
-                        char rb2[BUFFERSIZE] = {0};
-                        int r2n = read(mygame->player2Sock, rb2, BUFFERSIZE - 1);
-                        if (r2n <= 0) {
-                            send(mygame->player1Sock, "Rival desconectó. Partida finalizada\n", 34, 0);
-                            gameOver = true;
-                        } else {
-                            rb2[r2n] = '\0';
-                            std::string ans2(rb2);
-                            while (!ans2.empty() && (ans2.back()=='\n'||ans2.back()=='\r')) ans2.pop_back();
-                            std::transform(ans2.begin(), ans2.end(), ans2.begin(), ::tolower);
-                            mygame->replay2 = (ans2 == "si" || ans2 == "s" || ans2 == "yes" || ans2 == "y");
-                            mygame->hasReplay2 = true;
-                        }
-
-                        // notificar al otro hilo que ya respondió
-                        std::unique_lock<std::mutex> lk3(mygame->mtx);
-                        mygame->cv.notify_all();
-                        mygame->cv.wait_for(lk3, std::chrono::seconds(15), [&]{ return mygame->hasReplay1 || gameOver; });
-
-                        if (gameOver) break;
-                        if (!mygame->hasReplay1) mygame->replay1 = false;
-
-                        if (mygame->replay1 && mygame->replay2) {
-                            // reiniciar
-                            mygame->move1.clear(); mygame->move2.clear();
-                            mygame->ready1 = mygame->ready2 = false;
-                            mygame->resultSent = false;
-                            mygame->hasReplay1 = mygame->hasReplay2 = false;
-                            mygame->replay1 = mygame->replay2 = false;
-                            continue;
-                        } else {
-                            send(mygame->player1Sock, "Partida finalizada. Volviendo al chat.\n", 37, 0);
-                            send(mygame->player2Sock, "Partida finalizada. Volviendo al chat.\n", 37, 0);
-                            gameOver = true;
-                            break;
-                        }
-                    } else {
-                        // no corresponde
-                        send(sockCliente, "Error interno de emparejamiento\n", 30, 0);
-                        gameOver = true;
-                        break;
-                    }
-                }
-                // marcar fin de manejo PvP y continuar el bucle de chat
-                continue;
             } else {
-                send(sockCliente, "Opción inválida. Cancelando piedra_papel_tijera\n", 45, 0);
-                continue;
+                // Error or disconnect, restore menu state and the loop will exit
+                setClientMenuState(clientId, true);
             }
+            continue; // After handling game logic, continue to the next loop iteration
         }
 
         // Si hay una pregunta activa para la trivia, chequear respuestas
         if (triviaActive.load() && questionActive.load()) {
-            std::string lower = msg;
-            std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-            std::lock_guard<std::mutex> lock(trivia_mutex);
-            if (questionActive.load() && !answered.load() && lower == currentAnswer) {
-                // Otorgar punto
-                triviaScores[clientId]++;
-                answered = true;
-                std::string quien = getClientNameById(clientId);
-                broadcastMessage("Respuesta correcta de: " + quien + "\n");
-            }
+            std::string lower = trim(msg);
+                    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                    std::lock_guard<std::mutex> lock(trivia_mutex);
+                    if (questionActive.load() && !answered.load() && lower == currentAnswer) {
+                        // Otorgar punto y registrar al respondedor
+                        triviaScores[clientId]++;
+                        answered = true;
+                        triviaLastResponder = clientId;
+                    }
             // Si la trivia está activa, también no hacemos broadcast normal
             continue;
         }
@@ -689,6 +749,33 @@ void manejarCliente(int sockCliente, int clientId) {
             std::string despedida = "Adios " + nombre + "\n";
             send(sockCliente, despedida.c_str(), despedida.size(), 0);
             break;
+        }
+
+        // Si el cliente está en el menu principal, permitimos chat directo solo si hay 2 usuarios.
+        bool isInMenu = false;
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            for (auto &c : clients) if (c.id == clientId) { isInMenu = c.inMenu; break; }
+        }
+        if (isInMenu) {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            if (clients.size() == 2) {
+                // Enviar solo al otro usuario
+                for (auto &c : clients) {
+                    if (c.id != clientId) {
+                        std::string privado = nombre + " (privado): " + msg + "\n";
+                        send(c.sock, privado.c_str(), privado.size(), 0);
+                        break;
+                    }
+                }
+            } else {
+                std::string info = "En el menu principal. Comandos disponibles:\n";
+                info += "/juego_trivia\n";
+                info += "/piedra_papel_tijera\n";
+                info += "Escribe comando para jugar.\n";
+                send(sockCliente, info.c_str(), info.size(), 0);
+            }
+            continue;
         }
 
         // Mensaje normal: reenviar a todos
@@ -702,80 +789,78 @@ void manejarCliente(int sockCliente, int clientId) {
         std::lock_guard<std::mutex> lock(clients_mutex);
         clients.erase(std::remove_if(clients.begin(), clients.end(), [clientId](const ClientInfo &c){ return c.id == clientId; }), clients.end());
     }
-
+    
     activeClients--;
     std::cout << "Cliente " << clientId << " desconectado" << std::endl;
-}
-
+} // <-- This closes manejarCliente
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        std::cerr << "Uso: " << argv[0] << " <nClientes>  (ej: " << argv[0] << " 1)" << std::endl;
-        return 1;
-    }
-
-    int nClientes = 0;
-    try {
-        nClientes = std::stoi(argv[1]);
-    } catch (const std::invalid_argument &e) {
-        std::cerr << "Argumento inválido para nClientes: debe ser un número entero positivo.\n";
-        std::cerr << "Uso: " << argv[0] << " <nClientes>  (ej: " << argv[0] << " 1)" << std::endl;
-        return 1;
-    } catch (const std::out_of_range &e) {
-        std::cerr << "Argumento fuera de rango para nClientes." << std::endl;
-        return 1;
-    }
-
-    if (nClientes < 1) {
-        std::cerr << "nClientes debe ser >= 1" << std::endl;
-        return 1;
-    }
-
-    // 1. Configuración del Socket
-    int sockServidor;
-    crearSocket(sockServidor);
-
-    // 2. Vinculación
-    struct sockaddr_in confServidor;
-    configurarServidor(sockServidor, confServidor);
-
-    // 3. Escuchando conexiones entrantes
-    escucharClientes(sockServidor, nClientes);
-
-    std::cout << "Servidor escuchando en puerto " << PORT << std::endl;
-    std::cout << "Máximo de clientes simultáneos: " << nClientes << std::endl;
-
-    // 4. Aceptar conexiones (cada conexión en su propio hilo)
-    std::cout << "Esperando conexiones..." << std::endl;
-    int clienteIdCounter = 0;
-
-    while (true) {
-        int sockCliente;
-        struct sockaddr_in confCliente;
-
-        aceptarConexion(sockCliente, sockServidor, confCliente);
-
-        // Si ya alcanzamos el máximo de clientes concurrentes, rechazamos
-        if (activeClients.load() >= nClientes) {
-            std::string msg = "Servidor lleno, intente más tarde\n";
-            send(sockCliente, msg.c_str(), msg.size(), 0);
-            close(sockCliente);
-            std::cout << "Rechazada conexión: servidor lleno" << std::endl;
-            continue;
+        if (argc < 2) {
+            std::cerr << "Uso: " << argv[0] << " <nClientes>  (ej: " << argv[0] << " 1)" << std::endl;
+            return 1;
         }
 
-        // Aceptada
-        clienteIdCounter++;
-        activeClients++;
-        std::cout << "Cliente " << clienteIdCounter << " conectado (activos: " << activeClients.load() << ")" << std::endl;
+        int nClientes = 0;
+        try {
+            nClientes = std::stoi(argv[1]);
+        } catch (const std::invalid_argument &e) {
+            std::cerr << "Argumento inválido para nClientes: debe ser un número entero positivo.\n";
+            std::cerr << "Uso: " << argv[0] << " <nClientes>  (ej: " << argv[0] << " 1)" << std::endl;
+            return 1;
+        } catch (const std::out_of_range &e) {
+            std::cerr << "Argumento fuera de rango para nClientes." << std::endl;
+            return 1;
+        }
 
-        // Crear hilo detachable para manejar el cliente
-        std::thread t(manejarCliente, sockCliente, clienteIdCounter);
-        t.detach();
-    }
+        if (nClientes < 1) {
+            std::cerr << "nClientes debe ser >= 1" << std::endl;
+            return 1;
+        }
 
-    close(sockServidor);
-    std::cout << "Servidor cerrado" << std::endl;
-    return 0;
+        // 1. Configuración del Socket
+        int sockServidor;
+        crearSocket(sockServidor);
+
+        // 2. Vinculación
+        struct sockaddr_in confServidor;
+        configurarServidor(sockServidor, confServidor);
+
+        // 3. Escuchando conexiones entrantes
+        escucharClientes(sockServidor, nClientes);
+
+        std::cout << "Servidor escuchando en puerto " << PORT << std::endl;
+        std::cout << "Máximo de clientes simultáneos: " << nClientes << std::endl;
+
+        // 4. Aceptar conexiones (cada conexión en su propio hilo)
+        std::cout << "Esperando conexiones..." << std::endl;
+        int clienteIdCounter = 0;
+
+        while (true) {
+            int sockCliente;
+            struct sockaddr_in confCliente;
+
+            aceptarConexion(sockCliente, sockServidor, confCliente);
+
+            // Si ya alcanzamos el máximo de clientes concurrentes, rechazamos
+            if (activeClients.load() >= nClientes) {
+                std::string msg = "Servidor lleno, intente más tarde\n";
+                send(sockCliente, msg.c_str(), msg.size(), 0);
+                close(sockCliente);
+                std::cout << "Rechazada conexión: servidor lleno" << std::endl;
+                continue;
+            }
+
+            // Aceptada
+            clienteIdCounter++;
+            activeClients++;
+            std::cout << "Cliente " << clienteIdCounter << " conectado (activos: " << activeClients.load() << ")" << std::endl;
+
+            // Crear hilo detachable para manejar el cliente
+            std::thread t(manejarCliente, sockCliente, clienteIdCounter);
+            t.detach();
+        }
+
+        close(sockServidor);
+        std::cout << "Servidor cerrado" << std::endl;
+        return 0;
 }
-// end of file
